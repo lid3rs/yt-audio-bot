@@ -37,15 +37,36 @@ split into parts sent as separate tracks. A 1-hour talk arrives as one ~30 MB fi
 
 ## Setup
 
-1. **@BotFather** → `/newbot` → copy the token.
-2. **@userinfobot** → your numeric Telegram id.
-3. `cp .env.example .env` and fill in `BOT_TOKEN` and `ALLOWED_USER_ID`.
+### 1. Create your Telegram bot (2 minutes, free)
 
-### Run with docker compose
+1. In Telegram, search for **@BotFather** — the official bot-creation bot
+   (it has a blue verified checkmark).
+2. Send it `/newbot`.
+3. It asks for a **display name** — anything you like, e.g. `My Audio Bot`.
+4. It asks for a **username** — must be unique and end in `bot`,
+   e.g. `mysleepy_audio_bot`.
+5. BotFather replies with an **HTTP API token** that looks like
+   `1234567890:AAExxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx`. That's your `BOT_TOKEN` —
+   treat it like a password; anyone who has it controls the bot.
+
+### 2. Find your Telegram user id
+
+Message **@userinfobot** — it replies with your numeric id (e.g. `123456789`).
+That's your `ALLOWED_USER_ID`. The bot answers **only** this account and
+silently ignores everyone else, so nobody but you can use your server.
+
+### 3. Configure and run
 
 ```bash
+cp .env.example .env    # fill in BOT_TOKEN and ALLOWED_USER_ID
 docker compose up -d --build
 ```
+
+### 4. Start the chat
+
+Bots can't message you first: open `t.me/<your_bot_username>` (or find the bot
+by its username in search), press **Start**, and send it a YouTube link. The
+first reply can take a minute while the containers finish starting.
 
 ### Or deploy to a server with a registry + Portainer
 
