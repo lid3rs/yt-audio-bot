@@ -1,0 +1,31 @@
+# yt-audio-bot — Portainer stack (deployed automatically by ./deploy.sh).
+#
+# bgutil-provider generates YouTube PO tokens — required from datacenter IPs,
+# which otherwise get "Sign in to confirm you're not a bot".
+# The watchtower labels are inert unless you run Watchtower with label-enable.
+
+services:
+  yt-audio-bot:
+    image: ${IMAGE:?Set IMAGE in the stack environment variables}
+    container_name: yt-audio-bot
+    restart: unless-stopped
+    depends_on:
+      - bgutil-provider
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in the stack environment variables}
+      ALLOWED_USER_ID: ${ALLOWED_USER_ID:?Set ALLOWED_USER_ID in the stack environment variables}
+      POT_PROVIDER_URL: http://bgutil-provider:4416
+    volumes:
+      - audio-data:/data
+    labels:
+      com.centurylinklabs.watchtower.enable: 'true'
+
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: 'true'
+
+volumes:
+  audio-data:

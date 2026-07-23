@@ -1,0 +1,22 @@
+services:
+  yt-audio-bot:
+    build: .
+    image: yt-audio-bot:latest
+    container_name: yt-audio-bot
+    restart: unless-stopped
+    depends_on:
+      - bgutil-provider
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - ALLOWED_USER_ID=${ALLOWED_USER_ID}
+      - POT_PROVIDER_URL=http://bgutil-provider:4416
+    volumes:
+      - audio-data:/data
+
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: bgutil-provider
+    restart: unless-stopped
+
+volumes:
+  audio-data:
