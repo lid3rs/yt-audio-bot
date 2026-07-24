@@ -90,7 +90,13 @@ Running yt-dlp from a datacenter IP usually hits
 
 1. **PO tokens** (automatic): the bgutil provider container generates them and
    the bot requests the `web`/`mweb` player clients, which accept them.
-2. **Cookies** (one-time, if your IP is blocked even with tokens): log into
+2. **Self-healing on 403** (automatic): YouTube revokes its integrity tokens
+   long before their advertised lifetime, which turns into sudden
+   `HTTP Error 403: Forbidden` on downloads that worked hours earlier. When
+   that happens the bot flushes the provider's token caches
+   (`/invalidate_it` + `/invalidate_caches`) and retries once with yt-dlp's
+   cache bypassed — you just see "refreshing and retrying" instead of an error.
+3. **Cookies** (one-time, if your IP is blocked even with tokens): log into
    YouTube in an **incognito window** — ideally with a spare Google account —
    export cookies with a "Get cookies.txt LOCALLY"-style extension (Netscape
    format, *not* JSON), close the window without logging out, and **send the

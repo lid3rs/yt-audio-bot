@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import time
+import urllib.request
 from pathlib import Path
 
 import yt_dlp
@@ -73,8 +74,27 @@ def _help_text() -> str:
 # Blocking helpers (run via asyncio.to_thread)                                #
 # --------------------------------------------------------------------------- #
 
-def _download(url: str) -> tuple[Path, dict]:
-    """Download the audio track of `url` into DATA_DIR as .m4a."""
+def _invalidate_pot_caches() -> None:
+    """Ask the bgutil provider to drop its cached tokens.
+
+    YouTube revokes integrity tokens well before their advertised TTL; the
+    provider keeps deriving PO tokens from the dead one and every media request
+    answers 403 until the caches are flushed.
+    """
+    for endpoint in ("/invalidate_it", "/invalidate_caches"):
+        try:
+            req = urllib.request.Request(POT_PROVIDER_URL + endpoint, method="POST")
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:  # noqa: BLE001 - provider may be mid-restart; retry will tell
+            log.warning("PO-token cache invalidation via %s failed", endpoint)
+
+
+def _download(url: str, fresh: bool = False) -> tuple[Path, dict]:
+    """Download the audio track of `url` into DATA_DIR as .m4a.
+
+    With fresh=True yt-dlp's on-disk cache is bypassed too, so a retry after a
+    token flush cannot reuse a stale cached PO token or player signature.
+    """
     opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
         "outtmpl": str(DATA_DIR / "%(title).120B [%(id)s].%(ext)s"),
@@ -97,6 +117,8 @@ def _download(url: str) -> tuple[Path, dict]:
     cookies = DATA_DIR / "cookies.txt"
     if cookies.exists():
         opts["cookiefile"] = str(cookies)
+    if fresh:
+        opts["cachedir"] = False
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -203,7 +225,15 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     status = await msg.reply_text("⏳ Downloading audio…")
     try:
-        path, info = await asyncio.to_thread(_download, url)
+        try:
+            path, info = await asyncio.to_thread(_download, url)
+        except yt_dlp.utils.DownloadError as e:
+            if not (POT_PROVIDER_URL and "403" in str(e)):
+                raise
+            log.warning("403 from YouTube — flushing PO-token caches and retrying")
+            await status.edit_text("⏳ YouTube rejected the tokens — refreshing and retrying…")
+            await asyncio.to_thread(_invalidate_pot_caches)
+            path, info = await asyncio.to_thread(_download, url, True)
         files = await asyncio.to_thread(_shrink_or_split, path)
     except Exception as e:  # noqa: BLE001 - anything yt-dlp/ffmpeg throws ends up here
         log.exception("failed to fetch %s", url)
@@ -318,6 +348,11 @@ async def _post_init(app: Application) -> None:
         log.info("auto-cleanup enabled: files older than %.0fh are removed", CLEANUP_HOURS)
 
 
+async def _post_shutdown(app: Application) -> None:
+    for task in _background_tasks:
+        task.cancel()
+
+
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     app = (
@@ -328,6 +363,7 @@ def main() -> None:
         .write_timeout(120)
         .pool_timeout(30)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
     app.add_handler(CommandHandler(["start", "help"], cmd_help, filters=ONLY_ME))
