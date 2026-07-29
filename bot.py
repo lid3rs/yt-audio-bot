@@ -22,6 +22,7 @@ from pathlib import Path
 
 import yt_dlp
 from telegram import Update
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -328,6 +329,20 @@ async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 getattr(u, "id", "?"), getattr(u, "username", "?"))
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler.
+
+    Telegram infrastructure hiccups (502 Bad Gateway, dropped reads, timeouts)
+    are transient and run_polling retries them on its own, so log a one-liner
+    instead of a full traceback. Anything else is a real bug — trace it.
+    """
+    err = context.error
+    if isinstance(err, (NetworkError, TimedOut)):
+        log.warning("transient Telegram network error (auto-retried): %s", err)
+        return
+    log.error("unhandled error while processing an update", exc_info=err)
+
+
 async def _cleanup_loop() -> None:
     while True:
         cutoff = time.time() - CLEANUP_HOURS * 3600
@@ -373,6 +388,7 @@ def main() -> None:
     app.add_handler(MessageHandler(ONLY_ME & filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(ONLY_ME & filters.TEXT & ~filters.COMMAND, handle_link))
     app.add_handler(MessageHandler(~ONLY_ME, unauthorized))
+    app.add_error_handler(on_error)
 
     log.info("Bot up; audio stored in %s, send cap %s", DATA_DIR, _fmt_size(MAX_SEND_BYTES))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
