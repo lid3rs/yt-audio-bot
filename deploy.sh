@@ -59,6 +59,7 @@ env = [
     {"name": "BOT_TOKEN", "value": os.environ["BOT_TOKEN"]},
     {"name": "ALLOWED_USER_ID", "value": os.environ["ALLOWED_USER_ID"]},
     {"name": "IMAGE", "value": os.environ["IMAGE"]},
+    {"name": "PLAYER_CLIENTS", "value": os.environ.get("PLAYER_CLIENTS", "default")},
 ]
 
 existing = next((s for s in api("/api/stacks") if s["Name"] == name), None)

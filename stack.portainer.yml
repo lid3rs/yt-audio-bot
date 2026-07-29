@@ -15,6 +15,10 @@ services:
       BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN in the stack environment variables}
       ALLOWED_USER_ID: ${ALLOWED_USER_ID:?Set ALLOWED_USER_ID in the stack environment variables}
       POT_PROVIDER_URL: http://bgutil-provider:4416
+      # yt-dlp player client(s). "default" = yt-dlp's maintained set, which beats a
+      # pinned web/mweb (those 403 on the media stream from datacenter IPs for some
+      # videos). Override to force a specific client, e.g. PLAYER_CLIENTS=tv,web.
+      PLAYER_CLIENTS: ${PLAYER_CLIENTS:-default}
     volumes:
       - audio-data:/data
     labels:

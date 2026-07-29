@@ -47,8 +47,11 @@ FALLBACK_BITRATE_K = int(os.environ.get("FALLBACK_BITRATE_K", "64"))
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
 # Auto-delete stored audio after this many hours (0 disables the sweep).
 CLEANUP_HOURS = float(os.environ.get("CLEANUP_HOURS", "24"))
-# yt-dlp player clients; web/mweb consume PO tokens, which datacenter IPs need.
-PLAYER_CLIENTS = [c.strip() for c in os.environ.get("PLAYER_CLIENTS", "web,mweb").split(",") if c.strip()]
+# yt-dlp player clients. Empty = let yt-dlp choose its own (actively maintained)
+# default set. Pinning web/mweb turned out to be worse: their media URLs 403 from
+# datacenter IPs for some videos, while yt-dlp's default set picks a client that
+# downloads them. Set PLAYER_CLIENTS only to force a specific client for a video.
+PLAYER_CLIENTS = [c.strip() for c in os.environ.get("PLAYER_CLIENTS", "").split(",") if c.strip()]
 
 MAX_SEND_BYTES = int(MAX_SEND_MB * 1024 * 1024)
 UPLOAD_WRITE_TIMEOUT = 1800  # seconds; a 49 MB upload on a slow VPS link can be slow
@@ -109,12 +112,13 @@ def _download(url: str, fresh: bool = False) -> tuple[Path, dict]:
         "noprogress": True,
     }
     if POT_PROVIDER_URL:
-        opts["extractor_args"] = {
-            "youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]},
-            # The default android_vr client ignores PO tokens and is exactly what
-            # datacenter IPs get blocked on; web/mweb consume the provider's tokens.
-            "youtube": {"player_client": PLAYER_CLIENTS},
-        }
+        opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}}
+        # Only override the player client when explicitly asked. yt-dlp's default
+        # set already consumes the provider's PO tokens and, unlike a pinned
+        # web/mweb, avoids the media-stream 403 that datacenter IPs hit on some
+        # videos (verified: web/mweb 403, default downloads the same video).
+        if PLAYER_CLIENTS:
+            opts["extractor_args"]["youtube"] = {"player_client": PLAYER_CLIENTS}
     cookies = DATA_DIR / "cookies.txt"
     if cookies.exists():
         opts["cookiefile"] = str(cookies)
