@@ -1,20 +1,34 @@
-"""Personal Telegram bot: send it a YouTube link, get the audio track back.
+"""Multi-user Telegram bot: send it a YouTube link, get the audio track back.
 
-Usage in chat:
+The owner runs the bot and invites others with a one-time link. Every user only
+ever sees their own downloads — files live in a per-user folder and /list,
+/delete and the auto-cleanup all operate within the caller's folder.
+
+Usage in chat (any invited user):
   <YouTube link>   -> downloads the audio and sends it as a playable track
-  /list            -> numbered list of audio files stored on the server
-  /delete N        -> delete file number N from the last /list (a bare "N" works too)
-  /delete all      -> delete every stored file
+  /list            -> numbered list of *your* audio files
+  /delete N        -> delete file number N from your last /list (a bare "N" works too)
+  /delete all      -> delete everything *you* have stored
   /start, /help    -> short usage note
 
-Only the Telegram user with id ALLOWED_USER_ID is served; everyone else is ignored.
+Owner-only:
+  /invite          -> create a one-time invite link to hand to someone
+  /users           -> list invited users
+  /kick <id>       -> remove a user and delete their stored files
+
+Access is invite-only: the owner (OWNER_ID / legacy ALLOWED_USER_ID) is always
+allowed; everyone else must join through an invite link. The allow-list is
+persisted to DATA_DIR/users.json so it survives restarts.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import time
 import urllib.request
@@ -36,8 +50,11 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("yt-audio-bot")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
+# OWNER_ID is the admin who can invite/kick. ALLOWED_USER_ID is the old name for
+# the same thing, kept so existing .env files keep working.
+OWNER_ID = int(os.environ.get("OWNER_ID") or os.environ["ALLOWED_USER_ID"])
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+USERS_FILE = DATA_DIR / "users.json"
 # The Bot API rejects uploads over 50 MB, so anything bigger gets re-encoded and,
 # if that is still not enough, cut into parts that each fit.
 MAX_SEND_MB = float(os.environ.get("MAX_SEND_MB", "49"))
@@ -47,6 +64,9 @@ FALLBACK_BITRATE_K = int(os.environ.get("FALLBACK_BITRATE_K", "64"))
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "")
 # Auto-delete stored audio after this many hours (0 disables the sweep).
 CLEANUP_HOURS = float(os.environ.get("CLEANUP_HOURS", "24"))
+# Per-user storage cap. When a user's folder grows past this, their oldest files
+# are evicted to make room for the newest download (0 disables the cap).
+USER_QUOTA_MB = float(os.environ.get("USER_QUOTA_MB", "500"))
 # yt-dlp player clients. Empty = let yt-dlp choose its own (actively maintained)
 # default set. Pinning web/mweb turned out to be worse: their media URLs 403 from
 # datacenter IPs for some videos, while yt-dlp's default set picks a client that
@@ -54,24 +74,106 @@ CLEANUP_HOURS = float(os.environ.get("CLEANUP_HOURS", "24"))
 PLAYER_CLIENTS = [c.strip() for c in os.environ.get("PLAYER_CLIENTS", "").split(",") if c.strip()]
 
 MAX_SEND_BYTES = int(MAX_SEND_MB * 1024 * 1024)
+USER_QUOTA_BYTES = int(USER_QUOTA_MB * 1024 * 1024)
 UPLOAD_WRITE_TIMEOUT = 1800  # seconds; a 49 MB upload on a slow VPS link can be slow
 AUDIO_EXTS = {".m4a", ".mp3", ".opus", ".ogg", ".webm", ".aac", ".flac", ".wav"}
 URL_RE = re.compile(r"https?://\S+")
 
-ONLY_ME = filters.User(user_id=ALLOWED_USER_ID)
 
-def _help_text() -> str:
-    cookies = DATA_DIR / "cookies.txt"
-    return (
-        "Send me a YouTube link and I'll reply with the audio track.\n\n"
-        "/list — show stored audio files\n"
-        "/delete N — delete file N from the last list (or just send the number)\n"
-        "/delete all — wipe everything stored\n\n"
-        f"Files are auto-deleted after {CLEANUP_HOURS:.0f} h — no cleanup needed.\n"
-        + ("🍪 YouTube cookies are installed."
-           if cookies.exists()
-           else "No YouTube cookies installed — send me a cookies.txt file if YouTube demands sign-in.")
-    )
+# --------------------------------------------------------------------------- #
+# User allow-list & invites (persisted to DATA_DIR/users.json)                 #
+# --------------------------------------------------------------------------- #
+
+# uid -> {"username": str, "joined": epoch}. The owner is implicit (OWNER_ID).
+AUTHORIZED_USERS: dict[int, dict] = {}
+# code -> {"created": epoch}. One-time: consumed the moment someone joins with it.
+INVITES: dict[str, dict] = {}
+
+
+def _load_state() -> None:
+    global AUTHORIZED_USERS, INVITES
+    if not USERS_FILE.exists():
+        AUTHORIZED_USERS, INVITES = {}, {}
+        return
+    try:
+        data = json.loads(USERS_FILE.read_text())
+        AUTHORIZED_USERS = {int(k): v for k, v in data.get("authorized", {}).items()}
+        INVITES = dict(data.get("invites", {}))
+    except Exception:  # noqa: BLE001 - corrupt file shouldn't take the bot down
+        log.exception("could not read %s — starting with an empty user list", USERS_FILE)
+        AUTHORIZED_USERS, INVITES = {}, {}
+
+
+def _save_state() -> None:
+    """Atomically persist the allow-list (write to a temp file, then rename)."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = USERS_FILE.with_name(USERS_FILE.name + ".tmp")
+    tmp.write_text(json.dumps(
+        {
+            "authorized": {str(k): v for k, v in AUTHORIZED_USERS.items()},
+            "invites": INVITES,
+        },
+        indent=2,
+    ))
+    tmp.replace(USERS_FILE)
+
+
+def _is_authorized(uid: int) -> bool:
+    return uid == OWNER_ID or uid in AUTHORIZED_USERS
+
+
+class _AuthorizedFilter(filters.MessageFilter):
+    """Dynamic filter: matches messages from the owner or any invited user.
+
+    A plain filters.User() can't be used because the allow-list changes at
+    runtime as people are invited or kicked.
+    """
+
+    def filter(self, message) -> bool:
+        u = message.from_user
+        return bool(u and _is_authorized(u.id))
+
+
+AUTH = _AuthorizedFilter()
+OWNER = filters.User(user_id=OWNER_ID)
+
+
+def _user_dir(uid: int) -> Path:
+    return DATA_DIR / str(uid)
+
+
+def _help_text(uid: int) -> str:
+    has_cookies = (_user_dir(uid) / "cookies.txt").exists() or (DATA_DIR / "cookies.txt").exists()
+    lines = [
+        "Send me a YouTube link and I'll reply with the audio track.",
+        "",
+        "Commands",
+        "/help — show this message",
+        "/list — show your stored audio files",
+        "/delete N — delete file N from your last list (or just send the number)",
+        "/delete all — wipe everything you've stored",
+    ]
+    if uid == OWNER_ID:
+        lines += [
+            "",
+            "Owner commands",
+            "/invite — create a one-time invite link to share",
+            "/users — list invited users and unused invite links",
+            "/kick <id> — remove a user and delete their stored files",
+        ]
+    lines += [""]
+    if USER_QUOTA_BYTES > 0:
+        lines.append(
+            f"Your storage cap is {USER_QUOTA_MB:.0f} MB — when you hit it, your "
+            "oldest files are removed automatically."
+        )
+    lines += [
+        f"Files are auto-deleted after {CLEANUP_HOURS:.0f} h — no cleanup needed.",
+        ("🍪 YouTube cookies are installed."
+         if has_cookies
+         else "No YouTube cookies installed — send me a cookies.txt file if YouTube demands sign-in."),
+    ]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -93,15 +195,15 @@ def _invalidate_pot_caches() -> None:
             log.warning("PO-token cache invalidation via %s failed", endpoint)
 
 
-def _download(url: str, fresh: bool = False) -> tuple[Path, dict]:
-    """Download the audio track of `url` into DATA_DIR as .m4a.
+def _download(url: str, user_dir: Path, fresh: bool = False) -> tuple[Path, dict]:
+    """Download the audio track of `url` into `user_dir` as .m4a.
 
     With fresh=True yt-dlp's on-disk cache is bypassed too, so a retry after a
     token flush cannot reuse a stale cached PO token or player signature.
     """
     opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
-        "outtmpl": str(DATA_DIR / "%(title).120B [%(id)s].%(ext)s"),
+        "outtmpl": str(user_dir / "%(title).120B [%(id)s].%(ext)s"),
         "postprocessors": [
             {"key": "FFmpegExtractAudio", "preferredcodec": "m4a", "preferredquality": "0"}
         ],
@@ -119,9 +221,11 @@ def _download(url: str, fresh: bool = False) -> tuple[Path, dict]:
         # videos (verified: web/mweb 403, default downloads the same video).
         if PLAYER_CLIENTS:
             opts["extractor_args"]["youtube"] = {"player_client": PLAYER_CLIENTS}
-    cookies = DATA_DIR / "cookies.txt"
-    if cookies.exists():
-        opts["cookiefile"] = str(cookies)
+    # Per-user cookies win; a shared DATA_DIR/cookies.txt is the fallback.
+    for cookies in (user_dir / "cookies.txt", DATA_DIR / "cookies.txt"):
+        if cookies.exists():
+            opts["cookiefile"] = str(cookies)
+            break
     if fresh:
         opts["cachedir"] = False
 
@@ -187,13 +291,38 @@ def _shrink_or_split(path: Path) -> list[Path]:
     return parts
 
 
-def _stored_files() -> list[Path]:
-    if not DATA_DIR.exists():
+def _stored_files(base: Path) -> list[Path]:
+    if not base.exists():
         return []
     return sorted(
-        (p for p in DATA_DIR.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS),
+        (p for p in base.iterdir() if p.is_file() and p.suffix.lower() in AUDIO_EXTS),
         key=lambda p: p.stat().st_mtime,
     )
+
+
+def _enforce_quota(user_dir: Path, keep_names: set[str] | None = None) -> list[Path]:
+    """Delete the user's oldest files until the folder fits USER_QUOTA_BYTES.
+
+    Files named in `keep_names` (the just-finished download) are never evicted,
+    so a single download bigger than the whole quota is still delivered — only
+    *older* files are removed to make room. Returns what was deleted.
+    """
+    if USER_QUOTA_BYTES <= 0:
+        return []
+    keep_names = keep_names or set()
+    files = _stored_files(user_dir)  # oldest first
+    total = sum(p.stat().st_size for p in files)
+    evicted: list[Path] = []
+    for p in files:
+        if total <= USER_QUOTA_BYTES:
+            break
+        if p.name in keep_names:
+            continue
+        total -= p.stat().st_size
+        p.unlink(missing_ok=True)
+        evicted.append(p)
+        log.info("quota: evicted %s from user %s", p.name, user_dir.name)
+    return evicted
 
 
 def _fmt_size(n: float) -> str:
@@ -201,22 +330,124 @@ def _fmt_size(n: float) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Handlers                                                                    #
+# Access / invite handlers                                                    #
+# --------------------------------------------------------------------------- #
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /start, including /start <invite-code> from an invite link."""
+    user = update.effective_user
+    msg = update.effective_message
+    code = context.args[0] if context.args else None
+
+    if _is_authorized(user.id):
+        await msg.reply_text(_help_text(user.id))
+        return
+
+    if code and code in INVITES:
+        del INVITES[code]  # one-time: burn it immediately
+        AUTHORIZED_USERS[user.id] = {
+            "username": user.username or user.full_name,
+            "joined": time.time(),
+        }
+        _save_state()
+        _user_dir(user.id).mkdir(parents=True, exist_ok=True)
+        await msg.reply_text(
+            "✅ You're in! Send me a YouTube link and I'll reply with the audio.\n\n"
+            + _help_text(user.id)
+        )
+        try:
+            await context.bot.send_message(
+                OWNER_ID,
+                f"👤 {user.full_name} (@{user.username or '—'}, id {user.id}) joined via invite.",
+            )
+        except Exception:  # noqa: BLE001 - notifying the owner is best-effort
+            pass
+        return
+
+    if code:
+        await msg.reply_text(
+            "This invite link is invalid or has already been used. "
+            "Ask the owner for a fresh one."
+        )
+        return
+
+    await msg.reply_text("🔒 This bot is invite-only. Ask the owner for an invite link.")
+
+
+async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    code = secrets.token_urlsafe(6)
+    INVITES[code] = {"created": time.time()}
+    _save_state()
+    username = context.bot.username
+    link = f"https://t.me/{username}?start={code}"
+    await update.effective_message.reply_text(
+        "🎟 One-time invite link — valid until the first person taps it:\n"
+        f"{link}\n\n"
+        "Send it to whoever you want to invite."
+    )
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not AUTHORIZED_USERS:
+        await update.effective_message.reply_text(
+            "No invited users yet. Use /invite to add someone."
+        )
+        return
+    lines = ["Invited users:"]
+    for uid, meta in AUTHORIZED_USERS.items():
+        lines.append(f"• {meta.get('username', '?')} — id {uid}")
+    lines.append(f"\nUnused invite links: {len(INVITES)}")
+    lines.append("Remove someone with /kick <id>.")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args or not context.args[0].lstrip("-").isdigit():
+        await update.effective_message.reply_text("Usage: /kick <user id>  (see /users).")
+        return
+    uid = int(context.args[0])
+    if uid == OWNER_ID:
+        await update.effective_message.reply_text("You can't kick yourself.")
+        return
+    if uid not in AUTHORIZED_USERS:
+        await update.effective_message.reply_text("That id isn't on the list (see /users).")
+        return
+    AUTHORIZED_USERS.pop(uid)
+    _save_state()
+    shutil.rmtree(_user_dir(uid), ignore_errors=True)
+    await update.effective_message.reply_text(
+        f"🗑 Removed user {uid} and deleted their stored files."
+    )
+
+
+async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    u = update.effective_user
+    log.warning("Ignoring message from unauthorized user id=%s username=%s",
+                getattr(u, "id", "?"), getattr(u, "username", "?"))
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text("🔒 This bot is invite-only. Ask the owner for an invite link.")
+
+
+# --------------------------------------------------------------------------- #
+# Audio handlers                                                              #
 # --------------------------------------------------------------------------- #
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(_help_text())
+    await update.effective_message.reply_text(_help_text(update.effective_user.id))
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Accept a Netscape cookies.txt sent in chat and install it for yt-dlp."""
+    """Accept a Netscape cookies.txt sent in chat and install it for the sender."""
     msg = update.effective_message
     doc = msg.document
     if not doc or (doc.file_name or "").lower() != "cookies.txt":
         await msg.reply_text("If that's YouTube cookies, name the file cookies.txt and send again.")
         return
+    user_dir = _user_dir(update.effective_user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
     file = await doc.get_file()
-    await file.download_to_drive(DATA_DIR / "cookies.txt")
+    await file.download_to_drive(user_dir / "cookies.txt")
     await msg.reply_text("🍪 Cookies installed — send your link again.")
 
 
@@ -224,21 +455,23 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     msg = update.effective_message
     m = URL_RE.search(msg.text or "")
     if not m:
-        await msg.reply_text("That doesn't look like a link.\n\n" + _help_text())
+        await msg.reply_text("That doesn't look like a link.\n\n" + _help_text(update.effective_user.id))
         return
     url = m.group(0)
+    user_dir = _user_dir(update.effective_user.id)
+    user_dir.mkdir(parents=True, exist_ok=True)
 
     status = await msg.reply_text("⏳ Downloading audio…")
     try:
         try:
-            path, info = await asyncio.to_thread(_download, url)
+            path, info = await asyncio.to_thread(_download, url, user_dir)
         except yt_dlp.utils.DownloadError as e:
             if not (POT_PROVIDER_URL and "403" in str(e)):
                 raise
             log.warning("403 from YouTube — flushing PO-token caches and retrying")
             await status.edit_text("⏳ YouTube rejected the tokens — refreshing and retrying…")
             await asyncio.to_thread(_invalidate_pot_caches)
-            path, info = await asyncio.to_thread(_download, url, True)
+            path, info = await asyncio.to_thread(_download, url, user_dir, True)
         files = await asyncio.to_thread(_shrink_or_split, path)
     except Exception as e:  # noqa: BLE001 - anything yt-dlp/ffmpeg throws ends up here
         log.exception("failed to fetch %s", url)
@@ -246,6 +479,11 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     context.chat_data.pop("listing", None)  # stored /list numbering is stale now
+    try:
+        evicted = await asyncio.to_thread(_enforce_quota, user_dir, {f.name for f in files})
+    except Exception:  # noqa: BLE001 - eviction is housekeeping; never fail the send over it
+        log.exception("quota enforcement failed for %s", user_dir)
+        evicted = []
     n = len(files)
     for i, f in enumerate(files, 1):
         await status.edit_text("📤 Uploading…" if n == 1 else f"📤 Uploading part {i}/{n}…")
@@ -267,34 +505,44 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await status.edit_text(f"❌ Downloaded, but sending failed: {str(e)[:600]}")
             return
     await status.delete()
+    if evicted:
+        await msg.reply_text(
+            f"ℹ️ You hit your {USER_QUOTA_MB:.0f} MB storage cap — "
+            f"removed {len(evicted)} older file(s) to make room."
+        )
 
 
-def _render_list(context: ContextTypes.DEFAULT_TYPE) -> str:
+def _render_list(context: ContextTypes.DEFAULT_TYPE, user_dir: Path) -> str:
     """Build the numbered listing and remember it for number-based deletion."""
-    files = _stored_files()
+    files = _stored_files(user_dir)
     if not files:
         context.chat_data.pop("listing", None)
-        return "Nothing stored — the audio folder is empty."
+        return "Nothing stored — your audio folder is empty."
     context.chat_data["listing"] = [str(p) for p in files]
     lines = []
     for i, p in enumerate(files, 1):
         name = p.stem if len(p.stem) <= 64 else p.stem[:63] + "…"
         lines.append(f"{i}. {name}  ({_fmt_size(p.stat().st_size)})")
     total = sum(p.stat().st_size for p in files)
-    lines.append(f"\nTotal: {len(files)} file(s), {_fmt_size(total)}")
+    if USER_QUOTA_BYTES > 0:
+        lines.append(f"\nTotal: {len(files)} file(s), {_fmt_size(total)} of {USER_QUOTA_MB:.0f} MB")
+    else:
+        lines.append(f"\nTotal: {len(files)} file(s), {_fmt_size(total)}")
     lines.append("Delete one with /delete <number> — or just send me the number.")
     return "\n".join(lines)
 
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(_render_list(context))
+    user_dir = _user_dir(update.effective_user.id)
+    await update.effective_message.reply_text(_render_list(context, user_dir))
 
 
 async def _delete_by_token(update: Update, context: ContextTypes.DEFAULT_TYPE, token: str) -> None:
     msg = update.effective_message
+    user_dir = _user_dir(update.effective_user.id)
 
     if token.lower() == "all":
-        files = _stored_files()
+        files = _stored_files(user_dir)
         for p in files:
             p.unlink(missing_ok=True)
         context.chat_data.pop("listing", None)
@@ -311,7 +559,7 @@ async def _delete_by_token(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     path = Path(listing[int(token) - 1])
     path.unlink(missing_ok=True)
-    await msg.reply_text(f"🗑 Deleted: {path.stem}\n\n{_render_list(context)}")
+    await msg.reply_text(f"🗑 Deleted: {path.stem}\n\n{_render_list(context, user_dir)}")
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -325,12 +573,6 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def msg_number(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _delete_by_token(update, context, update.effective_message.text.strip())
-
-
-async def unauthorized(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    u = update.effective_user
-    log.warning("Ignoring message from unauthorized user id=%s username=%s",
-                getattr(u, "id", "?"), getattr(u, "username", "?"))
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -350,17 +592,44 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _cleanup_loop() -> None:
     while True:
         cutoff = time.time() - CLEANUP_HOURS * 3600
-        for p in _stored_files():
-            if p.stat().st_mtime < cutoff:
-                p.unlink(missing_ok=True)
-                log.info("auto-deleted after %.0fh: %s", CLEANUP_HOURS, p.name)
+        for udir in (p for p in DATA_DIR.iterdir() if p.is_dir()) if DATA_DIR.exists() else []:
+            for p in _stored_files(udir):
+                if p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+                    log.info("auto-deleted after %.0fh: %s", CLEANUP_HOURS, p.name)
         await asyncio.sleep(1800)
 
 
 _background_tasks = set()
 
 
+async def _set_command_menu(app: Application) -> None:
+    """Populate Telegram's "/" autocomplete menu.
+
+    Everyone sees the user commands; the owner's private chat additionally shows
+    the management commands, so the owner's menu is the full list.
+    """
+    from telegram import BotCommand, BotCommandScopeChat
+
+    user_cmds = [
+        BotCommand("help", "show help"),
+        BotCommand("list", "list your stored files"),
+        BotCommand("delete", "delete a file: /delete N or /delete all"),
+    ]
+    owner_cmds = user_cmds + [
+        BotCommand("invite", "create a one-time invite link"),
+        BotCommand("users", "list invited users"),
+        BotCommand("kick", "remove a user: /kick <id>"),
+    ]
+    try:
+        await app.bot.set_my_commands(user_cmds)
+        await app.bot.set_my_commands(owner_cmds, scope=BotCommandScopeChat(chat_id=OWNER_ID))
+    except Exception:  # noqa: BLE001 - the "/" menu is a nicety; don't block startup
+        log.exception("could not set the command menu")
+
+
 async def _post_init(app: Application) -> None:
+    await _set_command_menu(app)
     if CLEANUP_HOURS > 0:
         task = asyncio.create_task(_cleanup_loop())
         _background_tasks.add(task)  # keep a reference so the task isn't GC'd
@@ -374,9 +643,11 @@ async def _post_shutdown(app: Application) -> None:
 
 def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _load_state()
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .concurrent_updates(True)  # one user's long download must not block others
         .connect_timeout(30)
         .read_timeout(60)
         .write_timeout(120)
@@ -385,16 +656,24 @@ def main() -> None:
         .post_shutdown(_post_shutdown)
         .build()
     )
-    app.add_handler(CommandHandler(["start", "help"], cmd_help, filters=ONLY_ME))
-    app.add_handler(CommandHandler("list", cmd_list, filters=ONLY_ME))
-    app.add_handler(CommandHandler(["delete", "del"], cmd_delete, filters=ONLY_ME))
-    app.add_handler(MessageHandler(ONLY_ME & filters.Regex(r"^\s*\d+\s*$"), msg_number))
-    app.add_handler(MessageHandler(ONLY_ME & filters.Document.ALL, handle_document))
-    app.add_handler(MessageHandler(ONLY_ME & filters.TEXT & ~filters.COMMAND, handle_link))
-    app.add_handler(MessageHandler(~ONLY_ME, unauthorized))
+    # /start has no auth filter: it's how invitees join and how anyone gets a reply.
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help, filters=AUTH))
+    # Owner-only management commands.
+    app.add_handler(CommandHandler("invite", cmd_invite, filters=OWNER))
+    app.add_handler(CommandHandler("users", cmd_users, filters=OWNER))
+    app.add_handler(CommandHandler(["kick", "revoke"], cmd_kick, filters=OWNER))
+    # Everything below is for any invited user, scoped to their own folder.
+    app.add_handler(CommandHandler("list", cmd_list, filters=AUTH))
+    app.add_handler(CommandHandler(["delete", "del"], cmd_delete, filters=AUTH))
+    app.add_handler(MessageHandler(AUTH & filters.Regex(r"^\s*\d+\s*$"), msg_number))
+    app.add_handler(MessageHandler(AUTH & filters.Document.ALL, handle_document))
+    app.add_handler(MessageHandler(AUTH & filters.TEXT & ~filters.COMMAND, handle_link))
+    app.add_handler(MessageHandler(~AUTH, unauthorized))
     app.add_error_handler(on_error)
 
-    log.info("Bot up; audio stored in %s, send cap %s", DATA_DIR, _fmt_size(MAX_SEND_BYTES))
+    log.info("Bot up; owner id %s, %d invited user(s); audio stored in %s, send cap %s",
+             OWNER_ID, len(AUTHORIZED_USERS), DATA_DIR, _fmt_size(MAX_SEND_BYTES))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

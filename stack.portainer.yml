@@ -19,6 +19,9 @@ services:
       # pinned web/mweb (those 403 on the media stream from datacenter IPs for some
       # videos). Override to force a specific client, e.g. PLAYER_CLIENTS=tv,web.
       PLAYER_CLIENTS: ${PLAYER_CLIENTS:-default}
+      # Per-user storage cap in MB. When a user exceeds it, their oldest files
+      # are erased to make room for the newest download. 0 = unlimited.
+      USER_QUOTA_MB: ${USER_QUOTA_MB:-500}
     volumes:
       - audio-data:/data
     labels:
