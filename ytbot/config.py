@@ -36,6 +36,13 @@ USER_QUOTA_MB = float(os.environ.get("USER_QUOTA_MB", "500"))
 # datacenter IPs for some videos, while yt-dlp's default set picks a client that
 # downloads them. Set PLAYER_CLIENTS only to force a specific client for a video.
 PLAYER_CLIENTS = [c.strip() for c in os.environ.get("PLAYER_CLIENTS", "").split(",") if c.strip()]
+# Retry-only client set for "The page needs to be reloaded." When cookies are
+# installed yt-dlp treats the session as authenticated and leads with
+# tv_downgraded, which YouTube currently answers with that error
+# (yt-dlp/yt-dlp#17389). Dropping just that client and adding web_embedded is the
+# maintainers' workaround; keeping "default" means the set still tracks yt-dlp's
+# own choices instead of pinning us to today's clients.
+RELOAD_RETRY_CLIENTS = ["default", "-tv_downgraded", "web_embedded"]
 
 MAX_SEND_BYTES = int(MAX_SEND_MB * 1024 * 1024)
 USER_QUOTA_BYTES = int(USER_QUOTA_MB * 1024 * 1024)

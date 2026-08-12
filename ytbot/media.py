@@ -35,11 +35,20 @@ def invalidate_pot_caches() -> None:
             log.warning("PO-token cache invalidation via %s failed", endpoint)
 
 
-def download(url: str, user_dir: Path, fresh: bool = False) -> tuple[Path, dict]:
+def download(
+    url: str,
+    user_dir: Path,
+    fresh: bool = False,
+    player_clients: list[str] | None = None,
+) -> tuple[Path, dict]:
     """Download the audio track of `url` into `user_dir` as .m4a.
 
     With fresh=True yt-dlp's on-disk cache is bypassed too, so a retry after a
     token flush cannot reuse a stale cached PO token or player signature.
+
+    player_clients overrides both yt-dlp's own choice and the PLAYER_CLIENTS env
+    var for this one call; handle_link uses it to route around a client that
+    YouTube is currently breaking.
     """
     opts = {
         "format": "bestaudio[ext=m4a]/bestaudio/best",
@@ -53,14 +62,18 @@ def download(url: str, user_dir: Path, fresh: bool = False) -> tuple[Path, dict]
         "no_warnings": True,
         "noprogress": True,
     }
+    extractor_args = {}
     if POT_PROVIDER_URL:
-        opts["extractor_args"] = {"youtubepot-bgutilhttp": {"base_url": [POT_PROVIDER_URL]}}
-        # Only override the player client when explicitly asked. yt-dlp's default
-        # set already consumes the provider's PO tokens and, unlike a pinned
-        # web/mweb, avoids the media-stream 403 that datacenter IPs hit on some
-        # videos (verified: web/mweb 403, default downloads the same video).
-        if PLAYER_CLIENTS:
-            opts["extractor_args"]["youtube"] = {"player_client": PLAYER_CLIENTS}
+        extractor_args["youtubepot-bgutilhttp"] = {"base_url": [POT_PROVIDER_URL]}
+    # Only override the player client when explicitly asked. yt-dlp's default
+    # set already consumes the provider's PO tokens and, unlike a pinned
+    # web/mweb, avoids the media-stream 403 that datacenter IPs hit on some
+    # videos (verified: web/mweb 403, default downloads the same video).
+    clients = player_clients or PLAYER_CLIENTS
+    if clients:
+        extractor_args["youtube"] = {"player_client": clients}
+    if extractor_args:
+        opts["extractor_args"] = extractor_args
     # Per-user cookies win; a shared DATA_DIR/cookies.txt is the fallback.
     for cookies in (user_dir / "cookies.txt", DATA_DIR / "cookies.txt"):
         if cookies.exists():

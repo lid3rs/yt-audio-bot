@@ -8,6 +8,7 @@ from telegram.ext import ContextTypes
 
 from ..config import (
     POT_PROVIDER_URL,
+    RELOAD_RETRY_CLIENTS,
     UPLOAD_WRITE_TIMEOUT,
     URL_RE,
     USER_QUOTA_MB,
@@ -51,12 +52,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             path, info = await asyncio.to_thread(download, url, udir)
         except yt_dlp.utils.DownloadError as e:
-            if not (POT_PROVIDER_URL and "403" in str(e)):
+            if "needs to be reloaded" in str(e).lower():
+                # YouTube is breaking whichever client yt-dlp led with — almost
+                # always tv_downgraded, which it picks once cookies make the
+                # session look authenticated. Retry without that client.
+                log.warning("'page needs to be reloaded' — retrying without tv_downgraded")
+                await status.edit_text("⏳ YouTube refused that player — trying another…")
+                path, info = await asyncio.to_thread(
+                    download, url, udir, False, RELOAD_RETRY_CLIENTS
+                )
+            elif POT_PROVIDER_URL and "403" in str(e):
+                log.warning("403 from YouTube — flushing PO-token caches and retrying")
+                await status.edit_text("⏳ YouTube rejected the tokens — refreshing and retrying…")
+                await asyncio.to_thread(invalidate_pot_caches)
+                path, info = await asyncio.to_thread(download, url, udir, True)
+            else:
                 raise
-            log.warning("403 from YouTube — flushing PO-token caches and retrying")
-            await status.edit_text("⏳ YouTube rejected the tokens — refreshing and retrying…")
-            await asyncio.to_thread(invalidate_pot_caches)
-            path, info = await asyncio.to_thread(download, url, udir, True)
         files = await asyncio.to_thread(shrink_or_split, path)
     except Exception as e:  # noqa: BLE001 - anything yt-dlp/ffmpeg throws ends up here
         log.exception("failed to fetch %s", url)

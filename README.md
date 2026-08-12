@@ -119,17 +119,25 @@ If your Portainer has a self-signed certificate, pin it with
 ## YouTube on server IPs: PO tokens and cookies
 
 Running yt-dlp from a datacenter IP usually hits
-`Sign in to confirm you're not a bot`. Two layers deal with this:
+`Sign in to confirm you're not a bot`, and YouTube keeps breaking individual
+player clients. Four layers deal with this:
 
 1. **PO tokens** (automatic): the bgutil provider container generates them and
-   the bot requests the `web`/`mweb` player clients, which accept them.
+   yt-dlp's default player clients consume them.
 2. **Self-healing on 403** (automatic): YouTube revokes its integrity tokens
    long before their advertised lifetime, which turns into sudden
    `HTTP Error 403: Forbidden` on downloads that worked hours earlier. When
    that happens the bot flushes the provider's token caches
    (`/invalidate_it` + `/invalidate_caches`) and retries once with yt-dlp's
    cache bypassed — you just see "refreshing and retrying" instead of an error.
-3. **Cookies** (one-time, if your IP is blocked even with tokens): log into
+3. **Self-healing on "The page needs to be reloaded"** (automatic): once
+   cookies are installed yt-dlp treats the session as logged in and leads with
+   the `tv_downgraded` player client, which YouTube periodically breaks with
+   exactly that message ([yt-dlp#17389](https://github.com/yt-dlp/yt-dlp/issues/17389)).
+   The bot retries once without that client, so the failure is usually invisible
+   to you. If the retry also fails, deleting your cookies is the next thing to
+   try — the PO tokens alone are often enough.
+4. **Cookies** (one-time, if your IP is blocked even with tokens): log into
    YouTube in an **incognito window** — ideally with a spare Google account —
    export cookies with a "Get cookies.txt LOCALLY"-style extension (Netscape
    format, *not* JSON), close the window without logging out, and **send the
@@ -152,7 +160,7 @@ something (it does, regularly), restarting the container is the fix.
 | `MAX_SEND_MB` | `49` | re-encode/split threshold |
 | `FALLBACK_BITRATE_K` | `64` | bitrate for the shrink re-encode |
 | `POT_PROVIDER_URL` | — | bgutil provider URL (`http://bgutil-provider:4416` in the stack); empty disables |
-| `PLAYER_CLIENTS` | `web,mweb` | yt-dlp player clients to use when the PO provider is on |
+| `PLAYER_CLIENTS` | empty (yt-dlp's own default set) | force specific yt-dlp player clients, e.g. `tv,web`; `-name` excludes one |
 
 ## License
 
